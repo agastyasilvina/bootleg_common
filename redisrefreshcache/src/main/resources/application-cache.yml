@@ -1,0 +1,49 @@
+spring:
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+  task:
+    scheduling:
+      # Default is 1 thread. The refresh job blocks, so leave headroom for your other
+      # @Scheduled tasks or they queue behind it.
+      pool:
+        size: 4
+
+cache:
+  refresh:
+    enabled: true
+
+    # How often the refresh job runs. Keep this at roughly half the smallest
+    # refresh-before below, or passes will step over the refresh window.
+    interval: PT5M
+
+    lock-key: "cache:refresh:lock"
+    lock-ttl: PT10M       # must exceed batch-timeout
+    batch-timeout: PT5M   # hard ceiling on one pass
+    concurrency: 8        # max simultaneous upstream loads across all groups
+
+    # ---------------------------------------------------------------------
+    # Only the groups listed here participate. Any other Redis key your app
+    # writes is untouched. To stop refreshing a group without removing its
+    # code, set refresh-ahead: false — entries keep their TTL and simply
+    # expire, reloading on the next read.
+    # ---------------------------------------------------------------------
+    groups:
+
+      profile:
+        key-prefix: "profile:"
+        ttl: P1D
+        refresh-before: PT10M
+        refresh-ahead: true
+        # Ids warmed on startup, before anyone reads them. Bound from a
+        # comma-separated env var so your deploy pipeline can generate the
+        # list — an empty or absent var is fine.
+        preload-ids: ${HOT_PROFILE_IDS:}
+
+      # Same TTL policy, but never refreshed early: these entries expire and
+      # reload lazily. No CacheLoader bean is required for this group.
+      search-result:
+        key-prefix: "search:"
+        ttl: PT30M
+        refresh-ahead: false
