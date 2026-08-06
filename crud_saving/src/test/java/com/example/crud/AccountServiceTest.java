@@ -24,8 +24,8 @@ import reactor.core.publisher.Mono;
 import reactor.test.StepVerifier;
 
 /**
- * One test per failure mode the design prevents. Each is written so that removing the
- * corresponding safeguard turns it red — these are regression pins, not coverage.
+ * Replace-all semantics, plus the two failure modes that survive the simplification: the
+ * transaction, and validation running as a signal rather than an assembly-time throw.
  */
 @Testcontainers
 @SpringBootTest
@@ -33,6 +33,7 @@ import reactor.test.StepVerifier;
 class AccountServiceTest {
 
     private static final Long APP_ID = 42L;
+    private static final Long OTHER_APP_ID = 99L;
 
     @Container
     static PostgreSQLContainer<?> POSTGRES = new PostgreSQLContainer<>("postgres:16-alpine");
@@ -60,10 +61,10 @@ class AccountServiceTest {
     @BeforeEach
     void clean() {
         repo.deleteAll().block();
-        // The application row always exists before this endpoint is called; the FK enforces it.
-        db.sql("INSERT INTO application_tt (application_tt_id) VALUES (:id) "
+        // Both application rows always exist before the endpoint is called; the FK enforces it.
+        db.sql("INSERT INTO application_tt (application_tt_id) VALUES (:a), (:b) "
                         + "ON CONFLICT DO NOTHING")
-                .bind("id", APP_ID)
+                .bind("a", APP_ID).bind("b", OTHER_APP_ID)
                 .fetch().rowsUpdated().block();
     }
 
@@ -71,76 +72,82 @@ class AccountServiceTest {
         return new AccountDto(number, a, "b", "c");
     }
 
-    // ------------------------------------------------- 1. not found -> new row; found -> update
+    // ------------------------------------------------------------------ replace semantics
 
-    /** The core requirement: an unseen account_number becomes a new account_tt row. */
     @Test
-    void insertsAccountNumbersThatAreNotYetOnTheApplication() {
-        service.save(List.of(acct("111", "a"))).block();
-        service.save(List.of(acct("111", "a"), acct("222", "b"))).block();
-
-        List<AccountEntity> rows = repo.findByApplicationTtId(APP_ID).collectList().block();
-        assertThat(rows).extracting(AccountEntity::getAccountNumber)
-                .containsExactlyInAnyOrder("111", "222");
-        assertThat(rows).allMatch(r -> r.getApplicationTtId().equals(APP_ID));
-    }
-
-    /**
-     * Fails if an existing row is rebuilt rather than mutated: a rebuilt entity either duplicates
-     * the row (null id → INSERT) or writes nothing (stale id → UPDATE matching zero rows). Pinning
-     * account_tt_id exposes the first; pinning {@code a} exposes the second, which a row-count
-     * assertion alone would miss.
-     */
-    @Test
-    void updatesInPlaceRatherThanReinserting() {
-        service.save(List.of(acct("111", "x"))).block();
-        AccountEntity first = repo.findByApplicationTtId(APP_ID).blockFirst();
-
-        service.save(List.of(acct("111", "y"))).block();
-
-        StepVerifier.create(repo.findByApplicationTtId(APP_ID))
-                .assertNext(row -> {
-                    assertThat(row.getAccountTtId()).isEqualTo(first.getAccountTtId());
-                    assertThat(row.getA()).isEqualTo("y");
-                    assertThat(row.getCreatedAt()).isEqualTo(first.getCreatedAt());
-                })
-                .verifyComplete();                                    // and still only one row
-    }
-
-    /** Default is upsert: an account already stored but absent from the payload is left alone. */
-    @Test
-    void leavesAccountsMissingFromThePayloadAlone() {
-        service.save(List.of(acct("111", "a"), acct("222", "b"))).block();
-
-        service.save(List.of(acct("111", "updated"))).block();
+    void insertsThePostedAccounts() {
+        service.replace(List.of(acct("111", "a"), acct("222", "b"))).block();
 
         assertThat(repo.findByApplicationTtId(APP_ID).collectList().block())
                 .extracting(AccountEntity::getAccountNumber)
                 .containsExactlyInAnyOrder("111", "222");
     }
 
-    // ------------------------------------------------------------------ 2. transactions
+    /** The whole point: the second post is the new truth, not a merge with the first. */
+    @Test
+    void secondPostReplacesTheFirstEntirely() {
+        service.replace(List.of(acct("111", "a"), acct("222", "b"))).block();
+
+        service.replace(List.of(acct("333", "c"))).block();
+
+        assertThat(repo.findByApplicationTtId(APP_ID).collectList().block())
+                .extracting(AccountEntity::getAccountNumber)
+                .containsExactly("333");
+    }
 
     /**
-     * The only real proof {@code @Transactional} is active. If the annotation is inert — wrong
-     * transaction manager, self-invocation, or a non-reactive repository — the first element's
-     * update commits before the second fails, and the assertion below catches it.
+     * Pins the cost of replace-all so nobody is surprised by it later: resending an identical
+     * payload produces a <b>different</b> account_tt_id, because the row was deleted and remade.
+     * If this test ever needs to change, something outside is depending on the id being stable.
      */
     @Test
-    void rollsBackTheWholeBatchWhenOneWriteFails() {
-        service.save(List.of(acct("111", "original"))).block();
+    void accountIdsAreNotStableAcrossPosts() {
+        service.replace(List.of(acct("111", "a"))).block();
+        Long firstId = repo.findByApplicationTtId(APP_ID).blockFirst().getAccountTtId();
 
-        StepVerifier.create(service.save(List.of(
-                        acct("111", "should-not-survive"),
-                        new AccountDto("222", "x", "y", "z".repeat(300)))))  // exceeds VARCHAR(255)
-                .expectError(DataIntegrityViolationException.class)
-                .verify();
+        service.replace(List.of(acct("111", "a"))).block();
+        Long secondId = repo.findByApplicationTtId(APP_ID).blockFirst().getAccountTtId();
 
-        assertThat(repo.findByApplicationTtId(APP_ID).blockFirst().getA()).isEqualTo("original");
+        assertThat(secondId).isNotEqualTo(firstId);
         assertThat(repo.findByApplicationTtId(APP_ID).count().block()).isEqualTo(1L);
     }
 
-    // ------------------------------------------------- 3. errors are signals, not throws
+    /** The delete is scoped to one application — a replace must not touch anyone else's rows. */
+    @Test
+    void doesNotTouchOtherApplications() {
+        repo.save(AccountEntity.create(OTHER_APP_ID, acct("999", "other"))).block();
+
+        service.replace(List.of(acct("111", "a"))).block();
+
+        assertThat(repo.findByApplicationTtId(OTHER_APP_ID).collectList().block())
+                .extracting(AccountEntity::getAccountNumber)
+                .containsExactly("999");
+    }
+
+    // ------------------------------------------------------------------ the transaction
+
+    /**
+     * The one that matters most here. Delete-then-insert without a transaction is strictly worse
+     * than doing nothing: a failed insert leaves the application with <b>no</b> accounts at all.
+     * If {@code @Transactional} is inert — wrong manager, self-invocation, non-reactive repo —
+     * the delete commits and this assertion catches it.
+     */
+    @Test
+    void rollsBackToThePreviousAccountsWhenAnInsertFails() {
+        service.replace(List.of(acct("111", "original"))).block();
+
+        StepVerifier.create(service.replace(List.of(
+                        acct("222", "x"),
+                        new AccountDto("333", "y", "z", "w".repeat(300)))))  // exceeds VARCHAR(255)
+                .expectError(DataIntegrityViolationException.class)
+                .verify();
+
+        assertThat(repo.findByApplicationTtId(APP_ID).collectList().block())
+                .extracting(AccountEntity::getAccountNumber)
+                .containsExactly("111");
+    }
+
+    // ------------------------------------------------- errors are signals, not throws
 
     /**
      * The first assertion is the one almost every test omits: it calls the method <b>without
@@ -152,29 +159,22 @@ class AccountServiceTest {
     void rejectsDuplicatesAsAnErrorSignalNotAnAssemblyTimeThrow() {
         List<AccountDto> payload = List.of(acct("111", "a"), acct("111", "b"));
 
-        assertThatNoException().isThrownBy(() -> service.save(payload));
+        assertThatNoException().isThrownBy(() -> service.replace(payload));
 
-        StepVerifier.create(service.save(payload))
+        StepVerifier.create(service.replace(payload))
                 .expectErrorMessage("Duplicate accountNumber: 111")
                 .verify();
-
-        assertThat(repo.findByApplicationTtId(APP_ID).count().block()).isZero();
     }
 
-    // ------------------------------------------------------------------ 4. idempotence
-
+    /** Validation must reject before the delete runs, or a bad payload still wipes the rows. */
     @Test
-    void isIdempotent() {
-        List<AccountDto> payload = List.of(acct("111", "a"), acct("222", "b"));
+    void rejectsBadPayloadWithoutDeletingAnything() {
+        service.replace(List.of(acct("111", "a"))).block();
 
-        service.save(payload).block();
-        List<Long> idsAfterFirst = repo.findByApplicationTtId(APP_ID)
-                .map(AccountEntity::getAccountTtId).collectList().block();
+        StepVerifier.create(service.replace(List.of()))
+                .expectError(IllegalArgumentException.class)
+                .verify();
 
-        service.save(payload).block();
-
-        assertThat(repo.findByApplicationTtId(APP_ID)
-                .map(AccountEntity::getAccountTtId).collectList().block())
-                .containsExactlyInAnyOrderElementsOf(idsAfterFirst);
+        assertThat(repo.findByApplicationTtId(APP_ID).count().block()).isEqualTo(1L);
     }
 }

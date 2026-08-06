@@ -4,13 +4,11 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.data.r2dbc.config.EnableR2dbcAuditing;
 
 /**
- * Without this, {@code @CreatedDate} and {@code @LastModifiedDate} on the entity are inert and
- * both columns go out null — which the NOT NULL constraints in the DDL then reject. The failure
- * is at least loud rather than silent, but only if this is missing from the start; adding the
- * columns later without enabling auditing produces rows with null timestamps instead.
+ * Without this, {@code @CreatedDate} on {@link AccountEntity} is inert and {@code created_at} goes
+ * out null — which the NOT NULL column then rejects. Loud rather than silent, at least.
  *
- * <p>{@code Persistable.isNew()} also drives which of the two dates is populated, so this and the
- * entity's {@code isNew} flag have to stay consistent.
+ * <p>Only {@code @CreatedDate} is in play: rows are inserted and never updated, so there is no
+ * {@code @LastModifiedDate} to populate.
  */
 @Configuration
 @EnableR2dbcAuditing

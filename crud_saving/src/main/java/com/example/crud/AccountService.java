@@ -1,26 +1,25 @@
 package com.example.crud;
 
-import java.util.LinkedHashMap;
+import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
-import java.util.stream.Collectors;
+import java.util.Set;
 
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import reactor.core.publisher.Mono;
 
 /**
- * Saves an array of accounts against an {@code application_tt} row that already exists.
+ * Replaces an application's accounts with the posted array.
  *
- * <p>Matching is by {@code account_number} <i>within the application</i>: an account number
- * already on that application is updated in place, one that is not yet there becomes a new
- * {@code account_tt} row. Calling it twice with the same body changes nothing.
+ * <p>Every call deletes all {@code account_tt} rows for the application and reinserts the payload.
+ * There is no matching on {@code account_number} and no update path — that is the business
+ * decision, and it is what keeps this short.
  *
- * <p><b>By default nothing is deleted.</b> An account already stored but missing from the payload
- * is left alone. See {@link #pruneMissing} — that is the one behaviour here you may want to flip,
- * and it is off because the wrong choice in this direction destroys data.
+ * <p>Consequence worth knowing: <b>{@code account_tt_id} changes on every call.</b> The old rows
+ * are gone, not amended, so anything holding an account id — another table's foreign key, a
+ * client that cached one, a report keyed on it — is invalidated each time this runs. See the
+ * README if that is a problem; it is the one thing replace-all costs you.
  */
 @Service
 public class AccountService {
@@ -28,108 +27,65 @@ public class AccountService {
     private final AccountRepository repo;
     private final ApplicationProvider applications;
 
-    /**
-     * When true, accounts absent from the payload are deleted, making the request a full
-     * replace of the application's accounts rather than an upsert.
-     *
-     * <p>Off by default. With it on, a client that sends a partial list silently loses the rest,
-     * and a client that sends {@code []} loses everything — which is why {@code index(...)} also
-     * rejects an empty payload outright.
-     */
-    private final boolean pruneMissing;
-
-    public AccountService(AccountRepository repo,
-                          ApplicationProvider applications,
-                          @Value("${account.sync.prune-missing:false}") boolean pruneMissing) {
+    public AccountService(AccountRepository repo, ApplicationProvider applications) {
         this.repo = repo;
         this.applications = applications;
-        this.pruneMissing = pruneMissing;
     }
 
     /**
-     * The transaction manager is named explicitly. Spring Boot's R2DBC autoconfiguration registers
-     * it as {@code connectionFactoryTransactionManager}; naming it means that if JPA or plain JDBC
-     * joins the classpath, this keeps binding to the reactive manager rather than silently picking
-     * the blocking one and doing nothing. A wrong name fails at startup, which is the point.
+     * Delete and reinsert must be one transaction, or a failed insert leaves the application with
+     * no accounts at all — strictly worse than the state it started in.
      *
-     * <p>This only works because the repository is R2DBC — reactive {@code @Transactional} binds
-     * to the subscriber context and has no effect at all on a JDBC/JPA repository.
+     * <p>The transaction manager is named explicitly. Boot's R2DBC autoconfiguration registers it
+     * as {@code connectionFactoryTransactionManager}; naming it means that if JPA or plain JDBC
+     * joins the classpath, this keeps binding to the reactive manager rather than silently picking
+     * the blocking one and doing nothing. Reactive {@code @Transactional} has no effect whatsoever
+     * on a JDBC/JPA repository.
      */
     @Transactional("connectionFactoryTransactionManager")
-    public Mono<List<AccountDto>> save(List<AccountDto> incoming) {
-        // fromCallable, not a plain call: index() throws, and throwing here rather than inside the
-        // chain escapes at assembly time — before any subscription — which bypasses onError and
-        // surfaces as a 500 instead of the 400 the advice maps it to.
-        return Mono.fromCallable(() -> index(incoming))
-                .flatMap(desired -> applications.getApplicationMono()
+    public Mono<List<AccountDto>> replace(List<AccountDto> incoming) {
+        // fromCallable, not a plain call: validate() throws, and throwing here rather than inside
+        // the chain escapes at assembly time — before any subscription — which bypasses onError
+        // and surfaces as a 500 instead of the 400 the advice maps it to.
+        return Mono.fromCallable(() -> validate(incoming))
+                .flatMap(accounts -> applications.getApplicationMono()
                         .switchIfEmpty(Mono.error(new ApplicationNotFoundException()))
-                        .flatMap(app -> upsert(app.getId(), desired)));
+                        .flatMap(app -> replaceAll(app.getId(), accounts)));
     }
 
-    private Mono<List<AccountDto>> upsert(Long applicationTtId, Map<String, AccountDto> desired) {
-        return repo.findByApplicationTtId(applicationTtId)
-                .collectList()
-                .flatMap(existing -> {
+    private Mono<List<AccountDto>> replaceAll(Long applicationTtId, List<AccountDto> accounts) {
+        List<AccountEntity> rows = accounts.stream()
+                .map(dto -> AccountEntity.create(applicationTtId, dto))
+                .toList();
 
-                    Map<String, AccountEntity> byAccountNumber = existing.stream()
-                            .collect(Collectors.toMap(AccountEntity::getAccountNumber, e -> e));
-
-                    // Found  -> mutate the loaded row, keeping account_tt_id and created_at.
-                    // Absent -> a brand new account_tt row under the same application_tt_id.
-                    List<AccountEntity> toWrite = desired.values().stream()
-                            .map(dto -> {
-                                AccountEntity row = byAccountNumber.get(dto.accountNumber());
-                                return row == null
-                                        ? AccountEntity.create(applicationTtId, dto)
-                                        : row.apply(dto);
-                            })
-                            .toList();
-
-                    List<Long> toDelete = pruneMissing
-                            ? existing.stream()
-                                    .filter(row -> !desired.containsKey(row.getAccountNumber()))
-                                    .map(AccountEntity::getAccountTtId)
-                                    .toList()
-                            : List.of();
-
-                    // Deletes first. The unique constraint is DEFERRABLE INITIALLY DEFERRED so the
-                    // ordering is not load-bearing, but this order is correct with or without the
-                    // deferral. Guarded because deleteAllById on an empty collection would build
-                    // an "IN ()" predicate.
-                    Mono<Void> deletes = toDelete.isEmpty()
-                            ? Mono.empty()
-                            : repo.deleteAllById(toDelete);
-
-                    return deletes.thenMany(repo.saveAll(toWrite))
-                            .map(AccountEntity::toDto)
-                            .collectList();
-                });
+        return repo.deleteByApplicationTtId(applicationTtId)
+                .thenMany(repo.saveAll(rows))
+                .map(AccountEntity::toDto)
+                .collectList();
     }
 
     /**
-     * Validates and de-duplicates the payload in one pass.
-     *
-     * <p>A {@code Collectors.toMap} here would throw a bare {@code IllegalStateException} naming
-     * neither the field nor the offending value, so the explicit loop is deliberate.
-     * {@code LinkedHashMap} preserves request order so the response echoes back in the order sent.
+     * Rejects payloads the unique constraint would otherwise reject at commit, so the client gets
+     * a 400 naming the offending value instead of an opaque 409.
      */
-    private static Map<String, AccountDto> index(List<AccountDto> incoming) {
+    private static List<AccountDto> validate(List<AccountDto> incoming) {
         if (incoming == null || incoming.isEmpty()) {
+            // Under replace-all an empty array coherently means "this application has no
+            // accounts" — but it is also one stray client call from wiping them. Delete this
+            // block if you want that to be allowed.
             throw new IllegalArgumentException("At least one account is required");
         }
 
-        Map<String, AccountDto> desired = new LinkedHashMap<>();
+        Set<String> seen = new HashSet<>();
         for (AccountDto dto : incoming) {
             if (dto == null || dto.accountNumber() == null || dto.accountNumber().isBlank()) {
                 throw new IllegalArgumentException("accountNumber is required on every element");
             }
-            if (desired.put(dto.accountNumber(), dto) != null) {
-                // Keeping the last silently would make the request's effect depend on element
-                // order, and the resulting row count would quietly disagree with the payload size.
+            if (!seen.add(dto.accountNumber())) {
                 throw new IllegalArgumentException("Duplicate accountNumber: " + dto.accountNumber());
             }
         }
-        return desired;
+        return incoming;
     }
 
     /** No application for the session — a 404, not an insert against a null application_tt_id. */

@@ -4,29 +4,22 @@ import java.time.Instant;
 
 import org.springframework.data.annotation.CreatedDate;
 import org.springframework.data.annotation.Id;
-import org.springframework.data.annotation.LastModifiedDate;
-import org.springframework.data.annotation.Transient;
-import org.springframework.data.domain.Persistable;
 import org.springframework.data.relational.core.mapping.Column;
 import org.springframework.data.relational.core.mapping.Table;
 
 /**
- * A row of {@code account_tt}, hanging off an {@code application_tt} row that already exists by
- * the time this endpoint is called.
+ * A row of {@code account_tt}.
  *
- * <p>Implements {@link Persistable} so INSERT vs UPDATE is <b>stated</b> rather than inferred.
- * By default Spring Data R2DBC decides from whether the id is null, which fails in two directions:
- * a rebuilt entity with a null id gets INSERTed and duplicates the row, and an entity carrying an
- * id that is not in the table issues an UPDATE matching zero rows. Depending on the Spring Data
- * version the second case either throws {@code TransientDataAccessResourceException} or passes
- * silently — {@code AccountServiceTest.updatesInPlaceRatherThanReinserting} pins it either way.
+ * <p>Every instance is new. The endpoint deletes the application's accounts and reinserts them, so
+ * no row is ever loaded and updated — which is why there is no {@code Persistable}, no
+ * {@code isNew} flag and no mutator here. A null {@code account_tt_id} is all Spring Data R2DBC
+ * needs to choose INSERT, and it is null by construction.
  *
- * <p>{@link #create} is the only place {@code isNew} is set true and {@link #apply} is the only
- * mutator. Rows loaded through the mapper keep the {@code false} default, so anything read from
- * the database updates in place and retains its {@code account_tt_id} and {@code created_at}.
+ * <p>There is deliberately no {@code updated_at}: rows are never updated, so it would only ever
+ * equal {@code created_at}. Add the field back if your table declares that column NOT NULL.
  */
 @Table("account_tt")
-public class AccountEntity implements Persistable<Long> {
+public class AccountEntity {
 
     @Id
     @Column("account_tt_id")
@@ -46,41 +39,19 @@ public class AccountEntity implements Persistable<Long> {
     @Column("created_at")
     private Instant createdAt;
 
-    @LastModifiedDate
-    @Column("updated_at")
-    private Instant updatedAt;
-
-    /** Not a column. Entities are built per request and never reused across them. */
-    @Transient
-    private boolean isNew = false;
-
-    /** The only way to build a row that will be INSERTed. */
     public static AccountEntity create(Long applicationTtId, AccountDto dto) {
         AccountEntity e = new AccountEntity();
-        e.isNew = true;
-        e.applicationTtId = applicationTtId;
-        return e.apply(dto);
-    }
-
-    /**
-     * Copies the mutable fields across. Note {@code applicationTtId} and {@code accountTtId} are
-     * deliberately not touched — an existing row is edited, never re-parented or re-keyed.
-     */
-    public AccountEntity apply(AccountDto dto) {
-        this.accountNumber = dto.accountNumber();
-        this.a = dto.a();
-        this.b = dto.b();
-        this.c = dto.c();
-        return this;
+        e.applicationTtId = applicationTtId;      // account_tt_id stays null -> INSERT
+        e.accountNumber = dto.accountNumber();
+        e.a = dto.a();
+        e.b = dto.b();
+        e.c = dto.c();
+        return e;
     }
 
     public AccountDto toDto() {
         return new AccountDto(accountNumber, a, b, c);
     }
-
-    /** {@code Persistable<Long>} — the id here is {@code account_tt_id}. */
-    @Override public Long getId() { return accountTtId; }
-    @Override public boolean isNew() { return isNew; }
 
     public Long getAccountTtId()     { return accountTtId; }
     public Long getApplicationTtId() { return applicationTtId; }
@@ -89,5 +60,4 @@ public class AccountEntity implements Persistable<Long> {
     public String getB() { return b; }
     public String getC() { return c; }
     public Instant getCreatedAt() { return createdAt; }
-    public Instant getUpdatedAt() { return updatedAt; }
 }

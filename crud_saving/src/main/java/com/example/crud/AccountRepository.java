@@ -4,13 +4,14 @@ import org.springframework.data.repository.reactive.ReactiveCrudRepository;
 import org.springframework.stereotype.Repository;
 
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 @Repository
 public interface AccountRepository extends ReactiveCrudRepository<AccountEntity, Long> {
 
-    /**
-     * Current state for one application. Every {@code account_tt_id} the service later writes or
-     * deletes comes from here, which is what guarantees those ids refer to real rows.
-     */
+    /** Clears the application's accounts before the payload is reinserted. */
+    Mono<Void> deleteByApplicationTtId(Long applicationTtId);
+
+    /** Not used by the service — only by tests and by anything that reads the accounts back. */
     Flux<AccountEntity> findByApplicationTtId(Long applicationTtId);
 }

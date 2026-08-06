@@ -1,44 +1,42 @@
--- account_tt already exists in your schema; this is the shape the code assumes plus the two
--- constraints that make the reconcile safe. Apply them as ALTERs against the live table rather
--- than running the CREATE.
-
--- CREATE TABLE IF NOT EXISTS account_tt (
---     account_tt_id     BIGSERIAL   PRIMARY KEY,
---     application_tt_id BIGINT      NOT NULL,
---     account_number    VARCHAR(64) NOT NULL,
---     a                 VARCHAR(255),
---     b                 VARCHAR(255),
---     c                 VARCHAR(255),
---     created_at        TIMESTAMPTZ NOT NULL,
---     updated_at        TIMESTAMPTZ NOT NULL
--- );
-
--- 1. The uniqueness the service depends on.
+-- account_tt already exists; these are the two constraints the endpoint relies on.
+-- Apply them as ALTERs against the live table.
 --
--- This is not an optimisation. The service reads the application's accounts, decides which
--- account numbers are new, then inserts them — and two concurrent requests can both make that
--- decision before either commits. Nothing in application code can close that window; only the
--- database can. Without this you get duplicate account_numbers under one application, and every
--- later request then fails on Collectors.toMap.
+-- Columns the code assumes:
+--   account_tt_id     BIGSERIAL   PRIMARY KEY
+--   application_tt_id BIGINT      NOT NULL
+--   account_number    VARCHAR(64) NOT NULL
+--   a, b, c           VARCHAR(255)
+--   created_at        TIMESTAMPTZ NOT NULL
+-- There is no updated_at: rows are deleted and reinserted, never updated, so it would always
+-- equal created_at. If your table declares one NOT NULL, add the field back to AccountEntity.
+
+-- 1. Uniqueness within an application.
 --
--- DEFERRED so the check runs at COMMIT rather than per statement, which makes the
--- delete-before-insert ordering in the service belt-and-braces rather than a correctness
--- requirement. Trade-off: a deferrable constraint cannot back an ON CONFLICT clause, so if you
--- ever rewrite the reconcile as an upsert, drop DEFERRABLE and keep the ordering mandatory.
+-- Still needed even though the endpoint replaces wholesale. Two concurrent requests for the same
+-- application each delete only the rows their own snapshot can see, then both insert — so without
+-- this you end up with the union of both payloads rather than the last one. With it, the loser
+-- fails and retries against a settled state. Application code cannot close that window.
+--
+-- Not DEFERRABLE: the DELETE completes before any INSERT within the transaction, so there is
+-- never a transient duplicate for the check to trip over. (An earlier draft deferred it because
+-- the service updated rows in place; that no longer happens.)
 ALTER TABLE account_tt
     ADD CONSTRAINT uq_account_tt_application_account
-    UNIQUE (application_tt_id, account_number)
-    DEFERRABLE INITIALLY DEFERRED;
+    UNIQUE (application_tt_id, account_number);
 
--- 2. The parent link. The application row always exists before this endpoint is called, so the
--- FK should never fire in normal operation — which is exactly why it is worth having: it turns
--- "the session resolved to a stale or bogus application" into a loud constraint violation
--- instead of orphan rows nobody notices until a join starts dropping accounts.
+-- 2. The parent link. The application row always exists by the time this endpoint is called, so
+-- this should never fire — which is why it earns its place: it turns "the session resolved to a
+-- stale or bogus application" into a loud violation rather than orphan rows nobody notices.
 ALTER TABLE account_tt
     ADD CONSTRAINT fk_account_tt_application
     FOREIGN KEY (application_tt_id) REFERENCES application_tt (application_tt_id);
 
--- 3. findByApplicationTtId runs on every request. The unique constraint's index leads with
--- application_tt_id and already serves this, so add it only if you drop or reshape that
--- constraint.
--- CREATE INDEX IF NOT EXISTS idx_account_tt_application ON account_tt (application_tt_id);
+-- 3. BEFORE YOU SHIP: check whether anything references account_tt.account_tt_id.
+--
+--     SELECT conrelid::regclass AS referencing_table, conname
+--     FROM   pg_constraint
+--     WHERE  confrelid = 'account_tt'::regclass;
+--
+-- Replace-all deletes every account row on each call, so any child table pointing at those ids
+-- either blocks the delete (FK violation, endpoint starts failing) or loses its rows silently
+-- (ON DELETE CASCADE). If that query returns anything, replace-all is not safe as written.
