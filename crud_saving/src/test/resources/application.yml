@@ -1,0 +1,12 @@
+spring:
+  sql:
+    init:
+      # R2DBC honours this too; it is what creates the table before the tests run.
+      mode: always
+      schema-locations: classpath:schema.sql
+logging:
+  level:
+    # Uncomment while diagnosing a failing rollback assertion — it shows the transaction
+    # boundaries, which is usually enough to spot an inert @Transactional.
+    # org.springframework.r2dbc.connection.R2dbcTransactionManager: DEBUG
+    org.springframework.data.r2dbc: INFO
